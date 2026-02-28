@@ -1,0 +1,18 @@
+[project]
+name = "denseuav-homography"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "kornia>=0.8.2",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.2",
+    "pyyaml>=6.0.3",
+    "scipy>=1.17.1",
+    "timm>=1.0.25",
+    "torch>=2.10.0",
+    "torchaudio>=2.10.0",
+    "torchvision>=0.25.0",
+    "tqdm>=4.67.3",
+]

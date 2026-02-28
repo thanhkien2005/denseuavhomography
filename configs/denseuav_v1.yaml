@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────
+#  DenseUAV Homography Model — v1 config
+# ─────────────────────────────────────────────
+
+# ---------- paths ----------
+data_root: "../DenseUAV"           # relative to repo root; override via CLI
+
+# GPS / split files (relative to data_root)
+gps_train: "Dense_GPS_train.txt"
+gps_test:  "Dense_GPS_test.txt"
+gps_all:   "Dense_GPS_ALL.txt"
+
+# train folder layout  : {data_root}/train/drone/{id}/  &  train/satellite/{id}/
+# test  folder layout  : {data_root}/test/query_drone/{id}/  &  test/gallery_satellite/{id}/
+
+# ---------- input ----------
+img_size: 512          # both UAV and satellite resized to this
+drone_altitude: "H80"  # which altitude image to pick: H80 | H90 | H100
+                       # set to null to use all altitudes (data augmentation)
+
+# ---------- model ----------
+backbone: "vit_small_patch16_224"   # timm model name; input will be resized
+embed_dim: 384                       # ViT-S embed dim
+patch_size: 16
+num_patches: 1024                   # (512/16)^2
+
+gem_p: 3.0             # GeM pooling power; learnable if gem_learnable=true
+gem_learnable: true
+
+homo_hidden: 256       # HomographyNet intermediate channels
+gate_bias_init: -2.0   # sigmoid(-2) ≈ 0.12 → small warp contribution at start
+
+num_classes: 2256      # number of training location classes
+
+# ---------- training ----------
+seed: 42
+epochs: 120
+batch_size: 32         # per-GPU pairs  (uav, sat)
+num_workers: 4
+pin_memory: true
+
+optimizer: "adamw"
+lr: 1.0e-4
+weight_decay: 1.0e-4
+lr_scheduler: "cosine"
+warmup_epochs: 5
+min_lr: 1.0e-6
+
+# ---------- loss weights ----------
+loss:
+  w_ce:       1.0    # cross-entropy weight
+  w_triplet:  1.0    # soft-weighted triplet weight
+  w_kl:       1.0    # bi-directional KL (mutual learning) weight
+  temperature: 0.07  # logit scale temperature for KL / CE
+  margin:      0.3   # triplet margin
+
+# ---------- evaluation ----------
+recall_k: [1, 5, 10]   # Recall@K values to report
+sdm_k:    [1, 5, 10]   # SDM@K values to report
+
+# ---------- misc ----------
+output_dir: "outputs/denseuav_v1"
+log_interval: 50        # log every N iterations
+save_interval: 10       # save checkpoint every N epochs
+resume: null            # path to checkpoint to resume from
