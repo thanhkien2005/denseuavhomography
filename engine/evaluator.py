@@ -169,6 +169,95 @@ class Evaluator:
         return emb_uav, emb_sat, labels, uav_gps, sat_gps
 
     # ──────────────────────────────────────────────────────────────────────
+    # Internal: single-modality helpers for evaluate_split()
+    # ──────────────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _collect_uav_embeddings(
+        self,
+        model:      nn.Module,
+        dataloader: DataLoader,
+        desc:       str = "Extracting UAV",
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Collect UAV embeddings from a query-only dataloader.
+
+        Each batch must contain "uav_img", "label", and "uav_gps".
+        A zeros tensor is used as a dummy satellite input so that the model
+        forward can execute; emb_sat is discarded.  The UAV embedding is
+        mildly affected by the HomographyNet receiving zeros for sat_img
+        (warp gate ≈ 0.12 at init, gradient signal was minimal during
+        training), which is an accepted approximation for test evaluation.
+
+        Returns:
+            emb_uav : (Q, D)  L2-normalised UAV embeddings (CPU)
+            labels  : (Q,)    class labels (CPU)
+            uav_gps : (Q, 2)  GPS [lon, lat] (CPU); zeros if unavailable
+        """
+        model.eval()
+        model.to(self.device)
+
+        all_emb_uav: List[Tensor] = []
+        all_labels:  List[Tensor] = []
+        all_uav_gps: List[Tensor] = []
+
+        for batch in tqdm(dataloader, desc=desc, leave=False):
+            uav_img: Tensor = batch["uav_img"].to(self.device)
+            # Dummy zeros for sat_img — emb_uav is the only output used here.
+            dummy_sat = torch.zeros_like(uav_img)
+            outputs   = model(uav_img, dummy_sat)
+
+            all_emb_uav.append(outputs["emb_uav"].cpu())
+            all_labels.append(batch["label"].cpu())
+            all_uav_gps.append(batch["uav_gps"].cpu())
+
+        return (
+            torch.cat(all_emb_uav, dim=0),
+            torch.cat(all_labels,  dim=0),
+            torch.cat(all_uav_gps, dim=0),
+        )
+
+    @torch.no_grad()
+    def _collect_sat_embeddings(
+        self,
+        model:      nn.Module,
+        dataloader: DataLoader,
+        desc:       str = "Extracting SAT",
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Collect SAT embeddings from a gallery-only dataloader.
+
+        Each batch must contain "sat_img", "label", and "sat_gps".
+        emb_sat is computed solely from sat_img (the satellite branch does
+        not depend on uav_img), so zeros are safe as the dummy UAV input.
+
+        Returns:
+            emb_sat : (G, D)  L2-normalised SAT embeddings (CPU)
+            labels  : (G,)    class labels (CPU)
+            sat_gps : (G, 2)  GPS [lon, lat] (CPU); zeros if unavailable
+        """
+        model.eval()
+        model.to(self.device)
+
+        all_emb_sat: List[Tensor] = []
+        all_labels:  List[Tensor] = []
+        all_sat_gps: List[Tensor] = []
+
+        for batch in tqdm(dataloader, desc=desc, leave=False):
+            sat_img: Tensor = batch["sat_img"].to(self.device)
+            # emb_sat depends only on sat_img; zeros for uav_img are safe.
+            dummy_uav = torch.zeros_like(sat_img)
+            outputs   = model(dummy_uav, sat_img)
+
+            all_emb_sat.append(outputs["emb_sat"].cpu())
+            all_labels.append(batch["label"].cpu())
+            all_sat_gps.append(batch["sat_gps"].cpu())
+
+        return (
+            torch.cat(all_emb_sat, dim=0),
+            torch.cat(all_labels,  dim=0),
+            torch.cat(all_sat_gps, dim=0),
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
     # Public: paired evaluate (one dataloader, UAV=query, SAT=gallery)
     # ──────────────────────────────────────────────────────────────────────
 
@@ -246,40 +335,45 @@ class Evaluator:
     @torch.no_grad()
     def evaluate_split(
         self,
-        model:           nn.Module,
+        model:              nn.Module,
         query_dataloader:   DataLoader,   # yields UAV query batches
         gallery_dataloader: DataLoader,   # yields SAT gallery batches
-        prefix:          str = "test/",
+        prefix:             str  = "test/",
+        compute_sdm:        bool = True,
     ) -> Dict[str, float]:
         """Evaluate on disjoint query and gallery sets (proper test protocol).
 
-        Used for the DenseUAV test split where:
-            query_dataloader   → 777 drone images  (DenseUAVQuery dataset)
-            gallery_dataloader → 3033 satellite images (DenseUAVGallery dataset)
+        Used for the DenseUAV test split:
+            query_dataloader   → DenseUAVQuery   (777  drone images)
+            gallery_dataloader → DenseUAVGallery (3033 satellite images)
 
-        Both dataloaders must yield batches with:
-            "uav_img" / "sat_img", "label", "uav_gps" / "sat_gps" respectively.
+        Args:
+            model:              Siamese model with forward(uav_img, sat_img).
+            query_dataloader:   Yields batches with "uav_img", "label", "uav_gps".
+            gallery_dataloader: Yields batches with "sat_img", "label", "sat_gps".
+            prefix:             Metric key prefix (default "test/").
+            compute_sdm:        If False, skip SDM (use when GPS is unavailable).
 
-        TODO: Implement DenseUAVQuery + DenseUAVGallery datasets in
-              data/denseuav_dataset.py, then wire them up here.
+        Returns:
+            Dict of metric names → float values.
+            Keys: "{prefix}Recall@K" always;
+                  "{prefix}SDM@K"    only when compute_sdm=True.
 
         Shape trace:
-            query   emb_uav : (Q, D)   Q = 777
-            gallery emb_sat : (G, D)   G = 3033
-            sim             : (Q, G)
+            emb_uav_q : (Q, D)   Q = 777
+            emb_sat_g : (G, D)   G = 3033
+            sim       : (Q, G)
         """
-        # Collect query embeddings (UAV only)
-        emb_uav_q, _, q_labels, uav_gps, _ = self._collect_embeddings(
+        emb_uav_q, q_labels, uav_gps = self._collect_uav_embeddings(
             model, query_dataloader, desc=f"{prefix}query"
         )
-        # Collect gallery embeddings (SAT only)
-        _, emb_sat_g, g_labels, _, sat_gps = self._collect_embeddings(
+        emb_sat_g, g_labels, sat_gps = self._collect_sat_embeddings(
             model, gallery_dataloader, desc=f"{prefix}gallery"
         )
 
-        # Q x D  vs  G x D  — may differ in size
         results: Dict[str, float] = {}
 
+        # ── Recall@K ──────────────────────────────────────────────────────
         recall = recall_at_k(
             query_emb      = emb_uav_q,
             gallery_emb    = emb_sat_g,
@@ -290,16 +384,18 @@ class Evaluator:
         for k, v in recall.items():
             results[f"{prefix}Recall@{k}"] = v
 
-        sdm = sdm_at_k_multi(
-            query_emb   = emb_uav_q,
-            gallery_emb = emb_sat_g,
-            q_gps       = uav_gps,
-            g_gps       = sat_gps,
-            k_list      = self.sdm_k,
-            s           = self.sdm_s,
-        )
-        for k, v in sdm.items():
-            results[f"{prefix}SDM@{k}"] = v
+        # ── SDM@K (optional — requires valid GPS for both sets) ───────────
+        if compute_sdm:
+            sdm = sdm_at_k_multi(
+                query_emb   = emb_uav_q,
+                gallery_emb = emb_sat_g,
+                q_gps       = uav_gps,
+                g_gps       = sat_gps,
+                k_list      = self.sdm_k,
+                s           = self.sdm_s,
+            )
+            for k, v in sdm.items():
+                results[f"{prefix}SDM@{k}"] = v
 
         return results
 

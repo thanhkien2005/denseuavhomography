@@ -35,14 +35,16 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
-from data.transforms       import build_transforms
-from data.denseuav_dataset import DenseUAVPairs
+from data.paired_transforms import PairedTransform
+from data.denseuav_dataset  import DenseUAVPairs
 from data.samplers         import PairPerClassBatchSampler
 from engine.trainer        import Trainer
+from losses.contrastive    import InfoNCELoss
 from losses.total_loss     import DenseUAVLoss
-from models.vit_siamese    import SiameseViT
+from models.vit_siamese    import SiameseViT, load_checkpoint_compat
 from utils.checkpoint      import resume_if_possible, save_checkpoint, unwrap_model
 from utils.logger          import get_logger
+from utils.memory_queue    import MemoryQueue
 from utils.meters          import MetricCollection
 from utils.seed            import set_seed
 
@@ -190,18 +192,19 @@ def main() -> None:
     logger.info(f"  device     : {device}")
 
     # ── Transforms ────────────────────────────────────────────────────────
-    img_size = cfg["img_size"]
-    tf_uav   = build_transforms(img_size=img_size, is_train=True,  modality="uav")
-    tf_sat   = build_transforms(img_size=img_size, is_train=True,  modality="satellite")
+    # PairedTransform applies the SAME random flip/rotation to both UAV and
+    # SAT images, preserving their spatial correspondence so HomographyNet
+    # receives a valid gradient signal.
+    img_size  = cfg["img_size"]
+    tf_paired = PairedTransform(img_size=img_size, is_train=True)
 
     # ── Dataset + Sampler + DataLoader ────────────────────────────────────
     logger.info("Building dataset ...")
     dataset = DenseUAVPairs(
-        data_root      = data_root,
-        gps_file       = cfg["gps_train"],
-        drone_altitude = cfg.get("drone_altitude", "H80"),
-        transform_uav  = tf_uav,
-        transform_sat  = tf_sat,
+        data_root        = data_root,
+        gps_file         = cfg["gps_train"],
+        drone_altitude   = cfg.get("drone_altitude", "H80"),
+        paired_transform = tf_paired,
     )
     logger.info(f"  {dataset}")
 
@@ -220,14 +223,17 @@ def main() -> None:
 
     # ── Model ─────────────────────────────────────────────────────────────
     logger.info("Building model ...")
+    head_cfg = cfg.get("head", {})
     model = SiameseViT(
-        num_classes   = dataset.num_classes,
-        embed_dim     = cfg.get("embed_dim", 384),
-        img_size      = img_size,
-        patch_size    = cfg.get("patch_size", 16),
-        gem_p         = cfg.get("gem_p", 3.0),
-        gem_learnable = cfg.get("gem_learnable", True),
-        pretrained    = pretrained,
+        num_classes          = dataset.num_classes,
+        embed_dim            = cfg.get("embed_dim", 384),
+        img_size             = img_size,
+        patch_size           = cfg.get("patch_size", 16),
+        gem_p                = cfg.get("gem_p", 3.0),
+        gem_learnable        = cfg.get("gem_learnable", True),
+        pretrained           = pretrained,
+        head_scale           = head_cfg.get("scale", 30.0),
+        head_learnable_scale = head_cfg.get("learnable_scale", True),
     ).to(device)
     logger.info(f"  {model}")
 
@@ -249,11 +255,13 @@ def main() -> None:
     # ── Loss criterion ────────────────────────────────────────────────────
     loss_cfg  = cfg.get("loss", {})
     criterion = DenseUAVLoss(
-        w_ce         = loss_cfg.get("w_ce",       1.0),
-        w_triplet    = loss_cfg.get("w_triplet",  1.0),
-        w_kl         = loss_cfg.get("w_kl",       1.0),
+        w_ce         = loss_cfg.get("w_ce",        1.0),
+        w_triplet    = loss_cfg.get("w_triplet",   1.0),
+        w_kl         = loss_cfg.get("w_kl",        1.0),
+        w_homo       = loss_cfg.get("w_homo",      0.5),
         temperature  = loss_cfg.get("temperature", 0.07),
         margin       = loss_cfg.get("margin",      0.3),
+        lambda_reg   = loss_cfg.get("lambda_reg",  0.01),
     )
     logger.info(f"  {criterion}")
 
@@ -265,6 +273,26 @@ def main() -> None:
     else:
         logger.info("  AMP disabled (CPU or --no_amp flag).")
 
+    # ── Contrastive memory queue + InfoNCE loss ───────────────────────────
+    con_cfg        = cfg.get("contrastive", {})
+    use_contrastive = con_cfg.get("use_contrastive", False)
+    queue          = None
+    contrastive    = None
+    w_contrastive  = 0.0
+
+    if use_contrastive:
+        embed_dim     = cfg.get("embed_dim", 384)
+        queue_size    = con_cfg.get("queue_size", 4096)
+        con_temp      = con_cfg.get("temperature", 0.07)
+        w_contrastive = con_cfg.get("w_contrastive", 1.0)
+
+        queue       = MemoryQueue(queue_size=queue_size, embed_dim=embed_dim, device=device)
+        contrastive = InfoNCELoss(temperature=con_temp)
+        logger.info(
+            f"  InfoNCE enabled — queue_size={queue_size}, "
+            f"T={con_temp}, w={w_contrastive}"
+        )
+
     # ── Resume ────────────────────────────────────────────────────────────
     ckpt, start_epoch = resume_if_possible(
         resume_path,
@@ -272,12 +300,15 @@ def main() -> None:
         logger=logger,
     )
     if ckpt is not None:
-        unwrap_model(model).load_state_dict(ckpt["model"])
+        load_checkpoint_compat(unwrap_model(model), ckpt["model"], logger=logger)
         optimizer.load_state_dict(ckpt["optimizer"])
         if ckpt.get("scheduler") is not None:
             scheduler.load_state_dict(ckpt["scheduler"])
         if scaler is not None and ckpt.get("scaler") is not None:
             scaler.load_state_dict(ckpt["scaler"])
+        if queue is not None and ckpt.get("queue") is not None:
+            queue.load_state_dict(ckpt["queue"])
+            logger.info(f"  Restored queue ({len(queue)} entries).")
         logger.info(f"Resumed from epoch {start_epoch}.")
 
     # ── Trainer ───────────────────────────────────────────────────────────
@@ -307,6 +338,9 @@ def main() -> None:
             optimizer=optimizer,
             scaler=scaler,
             epoch=epoch,
+            queue=queue,
+            contrastive=contrastive,
+            w_contrastive=w_contrastive,
         )
 
         # Step LR scheduler once per epoch
@@ -314,13 +348,18 @@ def main() -> None:
         current_lr = optimizer.param_groups[0]["lr"]
 
         # Log epoch summary
+        summary_keys = ["loss_total", "loss_ce", "loss_triplet", "loss_kl", "loss_homo"]
+        if use_contrastive:
+            summary_keys.append("loss_contrastive")
         logger.info(
             f"Epoch {epoch+1} summary | lr={current_lr:.2e} | "
-            + " | ".join(
-                f"{k}={meters[k].avg:.4f}"
-                for k in ["loss_total", "loss_ce", "loss_triplet", "loss_kl"]
-            )
+            + " | ".join(f"{k}={meters[k].avg:.4f}" for k in summary_keys)
         )
+
+        # Log cosine-head scale if it is learnable
+        _cls = getattr(unwrap_model(model), "classifier", None)
+        if _cls is not None and isinstance(getattr(_cls, "scale", None), torch.nn.Parameter):
+            logger.info(f"  cosine_scale : {_cls.scale.item():.4f}")
 
         # TODO: add evaluation here once DenseUAVQuery/Gallery datasets exist
         # if (epoch + 1) % eval_interval == 0:
@@ -338,6 +377,7 @@ def main() -> None:
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
                     "scaler":    scaler.state_dict() if scaler is not None else None,
+                    "queue":     queue.state_dict() if queue is not None else None,
                     "metrics":   meters.summary(),
                     "config":    cfg,
                 },

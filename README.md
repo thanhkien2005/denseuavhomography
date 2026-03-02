@@ -101,21 +101,44 @@ Checkpoints are saved to `outputs/denseuav_v1/epoch_NNNN.pt` by default (configu
 
 Training logs go to `outputs/denseuav_v1/train.log`.
 
+### Homography diagnostics
+
+At the end of every epoch the trainer logs gate and delta statistics:
+
+```
+[homo] gate_mean=0.1234 gate_min=0.1043 gate_max=0.2187 | delta_norm_mean=0.4521 delta_abs_max=1.2043
+```
+
+`gate_mean` should rise above ~0.15 within the first 10 epochs when homography supervision is active. If it stays near 0.12, check that `loss.w_homo > 0` in the config.
+
 ---
 
 ## Evaluation
 
+Two evaluation modes are supported via `--split`:
+
+| `--split` | Dataset | Protocol |
+|-----------|---------|----------|
+| `train` (default) | `DenseUAVPairs` (2256 pairs) | Closed-set proxy — measures memorisation |
+| `test` | `DenseUAVQuery` (777) + `DenseUAVGallery` (3033) | **Official DenseUAV benchmark** |
+
 ```bash
-# Evaluate a checkpoint on the training split:
+# Official test-split evaluation (777 queries vs 3033 gallery):
 python scripts/eval.py \
-    --checkpoint outputs/denseuav_v1/epoch_0120.pt
+    --checkpoint outputs/denseuav_v1/epoch_0120.pt \
+    --split      test
+
+# Training-split proxy (quick sanity check):
+python scripts/eval.py \
+    --checkpoint outputs/denseuav_v1/epoch_0120.pt \
+    --split      train
 
 # Explicit options:
 python scripts/eval.py \
     --checkpoint  outputs/denseuav_v1/epoch_0120.pt \
     --config      configs/denseuav_v1.yaml \
     --data_root   /path/to/DenseUAV \
-    --split       train \
+    --split       test \
     --batch_size  16 \
     --device      cuda
 
@@ -136,12 +159,10 @@ Reported metrics:
 | SDM@5       | Soft distance match score at K=5                       |
 | SDM@10      | Soft distance match score at K=10                      |
 
-Evaluation log is appended to `<checkpoint_dir>/eval.log`.
+SDM@K requires GPS coordinates in `Dense_GPS_test.txt`; a warning is logged
+and SDM is skipped automatically if GPS is unavailable.
 
-> **Note:** The proper test-split evaluation (777 query UAV vs 3033 gallery
-> satellite images) requires `DenseUAVQuery` and `DenseUAVGallery` dataset
-> classes, which are marked as TODO in `data/denseuav_dataset.py`. Once
-> implemented, use `evaluator.evaluate_split(model, query_loader, gallery_loader)`.
+Evaluation log is appended to `<checkpoint_dir>/eval.log`.
 
 ---
 
@@ -165,13 +186,27 @@ batch_size: 32
 lr: 1.0e-4
 warmup_epochs: 5
 
-# Loss
+# Classifier head
+head:
+  scale: 30.0                    # initial logit scale for CosineClassifier
+  learnable_scale: true
+
+# Loss weights
 loss:
-  w_ce: 1.0
-  w_triplet: 1.0
-  w_kl: 1.0
-  temperature: 0.07
-  margin: 0.3
+  w_ce:       1.0
+  w_triplet:  1.0
+  w_kl:       1.0
+  w_homo:     0.5                # homography feature-alignment weight
+  lambda_reg: 0.01               # delta L2 regularisation inside HomoAlignLoss
+  temperature: 4.0               # KL softmax temperature
+  margin:      0.3               # triplet margin
+
+# Contrastive learning (InfoNCE with memory queue)
+contrastive:
+  use_contrastive: true
+  queue_size:  4096              # cross-batch negatives kept in FIFO queue
+  temperature: 0.07              # InfoNCE temperature
+  w_contrastive: 1.0
 
 # Evaluation
 recall_k: [1, 5, 10]
@@ -180,29 +215,34 @@ sdm_k:    [1, 5, 10]
 
 ---
 
-## Hooks (engine/hooks.py)
+## Architecture Overview
 
-`engine/hooks.py` provides helpers for wiring periodic evaluation and
-checkpointing into a custom training loop:
+See `Model.md` for the full architecture description.  Brief summary:
 
-```python
-from engine.hooks import maybe_evaluate, maybe_save_checkpoint, BestCheckpointTracker
+| Component | Details |
+|-----------|---------|
+| Backbone | `vit_small_patch16_224` (timm), shared UAV+SAT, img_size=512, embed_dim=384 |
+| Pooling | GeM (p=3.0, learnable) |
+| Classifier | `CosineClassifier`: logits = s·(emb @ norm(W)ᵀ), s=30.0 learnable |
+| Homography | `HomographyNet` → delta (B,8) + gate_logit (B,1) → `HomographyWarpLayer` |
+| Augmentation | `PairedTransform`: shared random flip/rotation for UAV+SAT; color jitter UAV-only |
+| Total params | ~23.2 M |
 
-best_tracker = BestCheckpointTracker(metric_key="train/Recall@1")
+### Loss design
 
-for epoch in range(start_epoch, total_epochs):
-    # ... training ...
+```
+L = w_ce · CE  +  w_triplet · SWTriplet  +  w_kl · BiKL
+  + w_homo · HomoAlign(Fu_warped, Fs, gate, delta)
+  + w_con  · InfoNCE(emb_uav, emb_sat, queue)
+```
 
-    metrics = maybe_evaluate(
-        epoch=epoch + 1, eval_interval=10, total_epochs=total_epochs,
-        model=model, evaluator=evaluator, dataloader=val_loader, logger=logger,
-    )
-    maybe_save_checkpoint(
-        epoch=epoch + 1, save_interval=10, total_epochs=total_epochs,
-        state=state, output_dir=output_dir, logger=logger,
-    )
-    if metrics is not None:
-        best_tracker.update(metrics, state, output_dir, logger)
+`HomoAlign` provides direct gradient signal to `HomographyNet`:
+
+```
+gate    = sigmoid(gate_logit)
+L_align = mean( gate × |Fu_warped − Fs.detach()| )   # gate-weighted L1
+L_reg   = mean( delta² )                               # prevents extreme warps
+L_homo  = L_align + λ_reg × L_reg
 ```
 
 ---
@@ -212,38 +252,43 @@ for epoch in range(start_epoch, total_epochs):
 ```
 denseuav-homo/
 ├── configs/
-│   └── denseuav_v1.yaml        # all hyperparameters
+│   └── denseuav_v1.yaml             # all hyperparameters
 ├── data/
-│   ├── denseuav_dataset.py     # DenseUAVPairs dataset
-│   ├── samplers.py             # PairPerClassBatchSampler
-│   └── transforms.py          # train / val augmentation pipelines
+│   ├── denseuav_dataset.py          # DenseUAVPairs / DenseUAVQuery / DenseUAVGallery
+│   ├── paired_transforms.py         # PairedTransform — shared geometric augmentation
+│   ├── samplers.py                  # PairPerClassBatchSampler
+│   └── transforms.py               # single-image transform pipelines (eval use)
 ├── engine/
-│   ├── evaluator.py            # Evaluator: Recall@K + SDM@K
-│   ├── hooks.py                # periodic eval + checkpoint helpers
-│   └── trainer.py              # one-epoch training loop (AMP, grad clip)
+│   ├── evaluator.py                 # Evaluator: Recall@K + SDM@K
+│   ├── hooks.py                     # periodic eval + checkpoint helpers
+│   └── trainer.py                   # one-epoch training loop (AMP, grad clip, homo logging)
 ├── losses/
-│   ├── ce.py                   # LabelSmoothingCE
-│   ├── kl.py                   # BidirectionalKLLoss
-│   ├── sw_triplet.py           # SoftWeightedTripletLoss
-│   └── total_loss.py           # DenseUAVLoss (combined)
+│   ├── ce.py                        # LabelSmoothingCE
+│   ├── contrastive.py               # InfoNCELoss
+│   ├── homography_loss.py           # HomographyAlignmentLoss
+│   ├── kl.py                        # BidirectionalKLLoss (T=4.0, T²-scaled)
+│   ├── sw_triplet.py                # SoftWeightedTripletLoss
+│   └── total_loss.py                # DenseUAVLoss (combined)
 ├── metrics/
-│   ├── recall.py               # recall_at_k
-│   └── sdm.py                  # sdm_at_k, haversine_distance
+│   ├── recall.py                    # recall_at_k
+│   └── sdm.py                       # sdm_at_k, haversine_distance
 ├── models/
-│   ├── heads.py                # GeM pooling head
-│   ├── homography_net.py       # HomographyNet (delta + gate prediction)
-│   ├── homography_warp.py      # HomographyWarpLayer (kornia-based)
-│   └── vit_siamese.py          # SiameseViT — main model
+│   ├── cosine_head.py               # CosineClassifier (weight-normalised)
+│   ├── heads.py                     # GeM pooling head
+│   ├── homography_net.py            # HomographyNet (delta + gate prediction)
+│   ├── homography_warp.py           # HomographyWarpLayer (kornia-based)
+│   └── vit_siamese.py               # SiameseViT — main model
 ├── scripts/
-│   ├── eval.py                 # standalone evaluation entry point
-│   ├── sanity_check_shapes.py  # shape + metric correctness verification
-│   ├── sanity_check_batch.py   # dataloader batch inspection
-│   └── train.py                # training entry point
+│   ├── eval.py                      # standalone evaluation entry point
+│   ├── sanity_check_shapes.py       # shape + metric correctness verification
+│   ├── sanity_check_batch.py        # dataloader batch inspection
+│   └── train.py                     # training entry point
 ├── tests/
-│   └── test_warp_identity.py   # delta=0 → warp is identity
+│   └── test_warp_identity.py        # delta=0 → warp is identity
 └── utils/
-    ├── checkpoint.py           # save / load / resume helpers
-    ├── logger.py               # stdout + file logger
-    ├── meters.py               # AverageMeter, MetricCollection
-    └── seed.py                 # deterministic seed helper
+    ├── checkpoint.py                # save / load / resume helpers
+    ├── logger.py                    # stdout + file logger
+    ├── memory_queue.py              # MemoryQueue — FIFO embedding store
+    ├── meters.py                    # AverageMeter, MetricCollection
+    └── seed.py                      # deterministic seed helper
 ```

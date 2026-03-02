@@ -43,7 +43,8 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.meters import MetricCollection
+from utils.memory_queue import MemoryQueue
+from utils.meters       import MetricCollection
 
 
 class Trainer:
@@ -88,41 +89,56 @@ class Trainer:
 
     def train_one_epoch(
         self,
-        model:     nn.Module,
-        loader:    DataLoader,
-        optimizer: torch.optim.Optimizer,
-        scaler:    Optional[GradScaler],
-        epoch:     int = 0,
+        model:          nn.Module,
+        loader:         DataLoader,
+        optimizer:      torch.optim.Optimizer,
+        scaler:         Optional[GradScaler],
+        epoch:          int          = 0,
+        queue:          Optional[MemoryQueue] = None,
+        contrastive     = None,   # Optional[InfoNCELoss]
+        w_contrastive:  float        = 1.0,
     ) -> MetricCollection:
         """Run one full pass over the dataloader.
 
         Args:
-            model:     SiameseViT (or any module with forward(uav,sat)->dict).
-            loader:    DataLoader yielding batches with "uav_img", "sat_img",
-                       "label" keys.
-            optimizer: Gradient-descent optimizer (e.g. AdamW).
-            scaler:    GradScaler for AMP; pass None when AMP is disabled.
-            epoch:     Current epoch index (0-based), used for logging.
+            model:         SiameseViT (or any module with forward(uav,sat)->dict).
+            loader:        DataLoader yielding batches with "uav_img", "sat_img",
+                           "label" keys.
+            optimizer:     Gradient-descent optimizer (e.g. AdamW).
+            scaler:        GradScaler for AMP; pass None when AMP is disabled.
+            epoch:         Current epoch index (0-based), used for logging.
+            queue:         Optional MemoryQueue for cross-batch negatives.
+            contrastive:   Optional InfoNCELoss; used only when queue is given.
+            w_contrastive: Weight applied to the InfoNCE term in the total loss.
 
         Returns:
-            MetricCollection with keys "loss_total", "loss_ce",
-            "loss_triplet", "loss_kl".  Access averages via .avg.
+            MetricCollection with keys "loss_total", "loss_ce", "loss_triplet",
+            "loss_kl", "loss_contrastive".  Access averages via .avg.
 
         Shape trace (per batch):
-            uav_img   : (B, 3, H, W)  → device
-            sat_img   : (B, 3, H, W)  → device
-            labels    : (B,)           → device
-            emb_uav   : (B, D)         from model
-            emb_sat   : (B, D)         from model
-            logit_uav : (B, C)         from model
-            logit_sat : (B, C)         from model
-            total_loss: ()             backward target
+            uav_img        : (B, 3, H, W)  → device
+            sat_img        : (B, 3, H, W)  → device
+            labels         : (B,)           → device
+            emb_uav        : (B, D)         from model
+            emb_sat        : (B, D)         from model
+            logit_uav      : (B, C)         from model
+            logit_sat      : (B, C)         from model
+            loss_contrastive: ()            InfoNCE (0 when queue/contrastive absent)
+            total_loss     : ()             backward target
         """
+        use_contrastive = (queue is not None) and (contrastive is not None)
+
         model.train()
         meters = MetricCollection(
-            ["loss_total", "loss_ce", "loss_triplet", "loss_kl"]
+            ["loss_total", "loss_ce", "loss_triplet", "loss_kl",
+             "loss_contrastive", "loss_homo", "gate_mean", "delta_norm_mean"]
         )
         device_type = self.device.type    # "cuda" or "cpu"
+
+        # Epoch-level min/max trackers (not smoothed — true extremes over epoch)
+        gate_epoch_min    = float("inf")
+        gate_epoch_max    = float("-inf")
+        delta_abs_max_ep  = 0.0
 
         for batch_idx, batch in enumerate(
             tqdm(loader, desc=f"Epoch {epoch}", leave=False)
@@ -153,6 +169,33 @@ class Trainer:
 
                 total_loss, loss_dict = self.criterion(outputs, labels)
                 # total_loss: scalar   loss_dict: {total,ce,triplet,kl}
+
+                # ── InfoNCE (batch + queue negatives) ─────────────────────
+                loss_con_val = 0.0
+                if use_contrastive:
+                    loss_con = contrastive(
+                        outputs["emb_uav"], outputs["emb_sat"],
+                        queue.uav_embeddings,   # (K, D) — past batches, detached
+                        queue.sat_embeddings,   # (K, D) — past batches, detached
+                    )
+                    total_loss   = total_loss + w_contrastive * loss_con
+                    loss_con_val = loss_con.item()
+
+            # ── Gate / delta diagnostic stats (no grad; float32 for accuracy) ──
+            with torch.no_grad():
+                gate_b  = torch.sigmoid(outputs["gate_logit"].detach().float())  # (B,1)
+                delta_b = outputs["delta"].detach().float()                        # (B,8)
+                gate_mean_val     = gate_b.mean().item()
+                gate_min_val      = gate_b.min().item()
+                gate_max_val      = gate_b.max().item()
+                delta_norm_val    = delta_b.norm(dim=1).mean().item()
+                delta_abs_max_val = delta_b.abs().max().item()
+
+            gate_epoch_min   = min(gate_epoch_min,   gate_min_val)
+            gate_epoch_max   = max(gate_epoch_max,   gate_max_val)
+            delta_abs_max_ep = max(delta_abs_max_ep, delta_abs_max_val)
+            meters["gate_mean"].update(gate_mean_val, n=B)
+            meters["delta_norm_mean"].update(delta_norm_val, n=B)
 
             # ── NaN guard ─────────────────────────────────────────────────
             # Check BEFORE .backward() to avoid poisoning model weights.
@@ -191,22 +234,45 @@ class Trainer:
 
                 optimizer.step()
 
+            # ── Enqueue current batch AFTER optimizer step ─────────────────
+            # Standard MoCo-style: embeddings are stale by one iteration,
+            # which prevents the queue from seeing its own gradients.
+            if use_contrastive:
+                queue.enqueue(
+                    outputs["emb_uav"].detach().float(),
+                    outputs["emb_sat"].detach().float(),
+                )
+
             # ── Accumulate meters ──────────────────────────────────────────
-            meters["loss_total"].update(total_loss.item(),           n=B)
-            meters["loss_ce"].update(loss_dict["ce"].item(),         n=B)
-            meters["loss_triplet"].update(loss_dict["triplet"].item(), n=B)
-            meters["loss_kl"].update(loss_dict["kl"].item(),         n=B)
+            meters["loss_total"].update(total_loss.item(),              n=B)
+            meters["loss_ce"].update(loss_dict["ce"].item(),            n=B)
+            meters["loss_triplet"].update(loss_dict["triplet"].item(),  n=B)
+            meters["loss_kl"].update(loss_dict["kl"].item(),            n=B)
+            meters["loss_contrastive"].update(loss_con_val,             n=B)
+            meters["loss_homo"].update(loss_dict.get("homo", torch.tensor(0.0)).item(), n=B)
 
             # ── Periodic logging ───────────────────────────────────────────
             if self.logger and (batch_idx + 1) % self.log_interval == 0:
                 lr = optimizer.param_groups[0]["lr"]
+                log_keys = ["loss_total", "loss_ce", "loss_triplet", "loss_kl", "loss_homo"]
+                if use_contrastive:
+                    log_keys.append("loss_contrastive")
                 self.logger.info(
                     f"epoch={epoch}  batch={batch_idx+1}/{len(loader)}  "
                     f"lr={lr:.2e}  "
                     + "  ".join(
-                        f"{k}={meters[k].avg:.4f}"
-                        for k in ["loss_total", "loss_ce", "loss_triplet", "loss_kl"]
+                        f"{k}={meters[k].avg:.4f}" for k in log_keys
                     )
                 )
+
+        # ── Epoch-end homography diagnostics ──────────────────────────────
+        if self.logger:
+            self.logger.info(
+                f"  [homo] gate_mean={meters['gate_mean'].avg:.4f} "
+                f"gate_min={gate_epoch_min:.4f} "
+                f"gate_max={gate_epoch_max:.4f} | "
+                f"delta_norm_mean={meters['delta_norm_mean'].avg:.4f} "
+                f"delta_abs_max={delta_abs_max_ep:.4f}"
+            )
 
         return meters

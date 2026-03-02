@@ -40,6 +40,7 @@ __getitem__ returns a dict with:
 
 from __future__ import annotations
 
+import glob
 import os
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -103,15 +104,20 @@ class DenseUAVPairs(Dataset):
     The label is a contiguous integer in [0, num_classes).
 
     Args:
-        data_root:      Path to the DenseUAV root directory.
-        gps_file:       Filename of the GPS annotation file relative to
-                        data_root (e.g. "Dense_GPS_train.txt").
-        drone_altitude: Altitude tag to select images, one of "H80", "H90",
-                        "H100", or None (use all available altitudes).
-                        NOTE: GPS is only available for H80; H90/H100 images
-                        will inherit GPS from the H80 entry of the same location.
-        transform_uav:  Transform applied to the UAV (PIL) image.
-        transform_sat:  Transform applied to the satellite (PIL) image.
+        data_root:        Path to the DenseUAV root directory.
+        gps_file:         Filename of the GPS annotation file relative to
+                          data_root (e.g. "Dense_GPS_train.txt").
+        drone_altitude:   Altitude tag to select images, one of "H80", "H90",
+                          "H100", or None (use all available altitudes).
+                          NOTE: GPS is only available for H80; H90/H100 images
+                          will inherit GPS from the H80 entry of the same location.
+        transform_uav:    Transform applied to the UAV (PIL) image independently.
+        transform_sat:    Transform applied to the satellite (PIL) image independently.
+        paired_transform: If provided, called as ``paired_transform(uav_pil, sat_pil)``
+                          returning ``(uav_tensor, sat_tensor)``.  Takes priority over
+                          transform_uav/transform_sat when set.  Use this to apply
+                          geometrically consistent augmentation (shared flips/rotation)
+                          so HomographyNet receives a valid gradient signal.
     """
 
     # Satellite image is always .tif; UAV image is always .JPG
@@ -123,16 +129,18 @@ class DenseUAVPairs(Dataset):
 
     def __init__(
         self,
-        data_root:      str,
-        gps_file:       str = "Dense_GPS_train.txt",
-        drone_altitude: Optional[str] = "H80",
-        transform_uav:  Optional[Callable] = None,
-        transform_sat:  Optional[Callable] = None,
+        data_root:        str,
+        gps_file:         str = "Dense_GPS_train.txt",
+        drone_altitude:   Optional[str] = "H80",
+        transform_uav:    Optional[Callable] = None,
+        transform_sat:    Optional[Callable] = None,
+        paired_transform: Optional[Callable] = None,
     ) -> None:
-        self.data_root      = os.path.abspath(data_root)
-        self.drone_altitude = drone_altitude
-        self.transform_uav  = transform_uav
-        self.transform_sat  = transform_sat
+        self.data_root        = os.path.abspath(data_root)
+        self.drone_altitude   = drone_altitude
+        self.transform_uav    = transform_uav
+        self.transform_sat    = transform_sat
+        self.paired_transform = paired_transform
 
         # --- parse GPS file ---
         gps_path = os.path.join(self.data_root, gps_file)
@@ -295,17 +303,21 @@ class DenseUAVPairs(Dataset):
         uav_pil = Image.open(drone_path).convert("RGB")
         sat_pil = Image.open(sat_path).convert("RGB")
 
-        if self.transform_uav is not None:
-            uav_img = self.transform_uav(uav_pil)   # (3, H, W)
+        if self.paired_transform is not None:
+            # Geometrically consistent: shared random flip/rotation
+            uav_img, sat_img = self.paired_transform(uav_pil, sat_pil)
         else:
-            from torchvision.transforms.functional import to_tensor
-            uav_img = to_tensor(uav_pil)
+            if self.transform_uav is not None:
+                uav_img = self.transform_uav(uav_pil)   # (3, H, W)
+            else:
+                from torchvision.transforms.functional import to_tensor
+                uav_img = to_tensor(uav_pil)
 
-        if self.transform_sat is not None:
-            sat_img = self.transform_sat(sat_pil)   # (3, H, W)
-        else:
-            from torchvision.transforms.functional import to_tensor
-            sat_img = to_tensor(sat_pil)
+            if self.transform_sat is not None:
+                sat_img = self.transform_sat(sat_pil)   # (3, H, W)
+            else:
+                from torchvision.transforms.functional import to_tensor
+                sat_img = to_tensor(sat_pil)
 
         # Sanity: shapes must be (3, img_size, img_size)
         assert uav_img.ndim == 3 and uav_img.shape[0] == 3, (
@@ -333,19 +345,305 @@ class DenseUAVPairs(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# TODO: Test/Evaluation datasets (implement when engine/evaluator.py is added)
+# Test/Evaluation datasets
 # ---------------------------------------------------------------------------
 
-# class DenseUAVQuery(Dataset):
-#     """Query set: drone images from test/query_drone/{loc_id}/H80.JPG.
-#     Returns: {"uav_img": (3,512,512), "label": (), "uav_gps": (2,)}
-#     777 query items (test split).
-#     """
-#     ...
-#
-# class DenseUAVGallery(Dataset):
-#     """Gallery set: satellite images from test/gallery_satellite/{loc_id}/H80.tif.
-#     Returns: {"sat_img": (3,512,512), "label": (), "sat_gps": (2,)}
-#     3033 gallery items (test split).
-#     """
-#     ...
+class DenseUAVQuery(Dataset):
+    """Query set: drone images from test/query_drone/{loc_id}/H80.JPG.
+
+    Implements the DenseUAV test query set (777 items).
+
+    Returns per item:
+        "uav_img" : FloatTensor (3, img_size, img_size)
+        "label"   : LongTensor  ()   — int(loc_id); consistent with DenseUAVGallery
+        "uav_gps" : FloatTensor (2,) — [lon, lat]; zeros tensor if GPS unavailable
+
+    Args:
+        data_root:      Path to DenseUAV root directory.
+        gps_file:       GPS annotation file relative to data_root.  GPS entries
+                        are satellite-side; query GPS is inferred from the same
+                        location's satellite entry.  If absent or unmatched,
+                        has_gps=False and uav_gps tensors are zeros.
+        drone_altitude: Altitude tag (default "H80").
+        transform_uav:  Transform applied to the UAV PIL image.
+
+    Attributes:
+        has_gps (bool): True if at least one sample has a valid GPS coordinate.
+    """
+
+    _DRONE_EXT    = ".JPG"
+    _GPS_ALTITUDE = "H80"
+
+    def __init__(
+        self,
+        data_root:      str,
+        gps_file:       str                = "Dense_GPS_test.txt",
+        drone_altitude: str                = "H80",
+        transform_uav:  Optional[Callable] = None,
+    ) -> None:
+        self.data_root      = os.path.abspath(data_root)
+        self.drone_altitude = drone_altitude
+        self.transform_uav  = transform_uav
+
+        gps_path = os.path.join(self.data_root, gps_file)
+        self._gps: Dict[str, Tuple[float, float, float]] = (
+            _parse_gps_file(gps_path) if os.path.isfile(gps_path) else {}
+        )
+
+        self.samples: List[Tuple[str, int, Optional[Tuple[float, float]]]]
+        self.samples = self._build_samples()
+
+        if len(self.samples) == 0:
+            raise FileNotFoundError(
+                f"No query drone images found under "
+                f"{os.path.join(self.data_root, 'test', 'query_drone')}. "
+                "Verify that data_root points to the DenseUAV root directory "
+                "and that the test/query_drone/ sub-tree is present."
+            )
+
+        self.has_gps: bool = any(s[2] is not None for s in self.samples)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_gps(self, loc_id: str) -> Optional[Tuple[float, float]]:
+        """Look up GPS for a test query location via its satellite entry.
+
+        Tries multiple GPS-file key formats to be robust against dataset
+        variants that use "test/satellite/" vs "test/gallery_satellite/".
+        """
+        sat_ext = DenseUAVPairs._SAT_EXT
+        for prefix in ("test/satellite", "test/gallery_satellite"):
+            key   = f"{prefix}/{loc_id}/{self._GPS_ALTITUDE}{sat_ext}"
+            entry = self._gps.get(key)
+            if entry is not None:
+                lon, lat, _ = entry
+                return (lon, lat)
+        return None
+
+    def _build_samples(
+        self,
+    ) -> List[Tuple[str, int, Optional[Tuple[float, float]]]]:
+        """Discover query images under test/query_drone/ and build sample list."""
+        query_base = os.path.join(self.data_root, "test", "query_drone")
+        if not os.path.isdir(query_base):
+            raise FileNotFoundError(
+                f"Test query_drone directory not found: {query_base}"
+            )
+
+        loc_ids = sorted(
+            d for d in os.listdir(query_base)
+            if os.path.isdir(os.path.join(query_base, d))
+        )
+        samples = []
+
+        for loc_id in loc_ids:
+            drone_dir = os.path.join(query_base, loc_id)
+            img_path  = os.path.join(
+                drone_dir, f"{self.drone_altitude}{self._DRONE_EXT}"
+            )
+            if not os.path.isfile(img_path):
+                # Fallback: first sorted JPG in the folder
+                candidates = sorted(
+                    glob.glob(os.path.join(drone_dir, f"*{self._DRONE_EXT}"))
+                )
+                if not candidates:
+                    continue
+                img_path = candidates[0]
+
+            try:
+                label = int(loc_id)
+            except ValueError:
+                label = len(samples)   # non-numeric fallback: sequential index
+
+            gps_xy = self._resolve_gps(loc_id)
+            samples.append((img_path, label, gps_xy))
+
+        return samples
+
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        img_path, label, gps_xy = self.samples[idx]
+
+        uav_pil = Image.open(img_path).convert("RGB")
+        if self.transform_uav is not None:
+            uav_img = self.transform_uav(uav_pil)
+        else:
+            from torchvision.transforms.functional import to_tensor
+            uav_img = to_tensor(uav_pil)
+
+        gps = (
+            torch.tensor(gps_xy, dtype=torch.float32)
+            if gps_xy is not None
+            else torch.zeros(2, dtype=torch.float32)
+        )
+
+        return {
+            "uav_img": uav_img,
+            "label":   torch.tensor(label, dtype=torch.long),
+            "uav_gps": gps,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"DenseUAVQuery("
+            f"n_queries={len(self)}, "
+            f"altitude={self.drone_altitude!r}, "
+            f"has_gps={self.has_gps})"
+        )
+
+
+class DenseUAVGallery(Dataset):
+    """Gallery set: satellite images from test/gallery_satellite/{loc_id}/H80.tif.
+
+    Implements the DenseUAV test gallery set (3033 items).
+
+    Returns per item:
+        "sat_img" : FloatTensor (3, img_size, img_size)
+        "label"   : LongTensor  ()   — int(loc_id); consistent with DenseUAVQuery
+        "sat_gps" : FloatTensor (2,) — [lon, lat]; zeros tensor if GPS unavailable
+
+    Args:
+        data_root:      Path to DenseUAV root directory.
+        gps_file:       GPS annotation file relative to data_root.
+        drone_altitude: Altitude tag used to select the .tif file (default "H80").
+        transform_sat:  Transform applied to the satellite PIL image.
+
+    Attributes:
+        has_gps (bool): True if at least one sample has a valid GPS coordinate.
+    """
+
+    _SAT_EXT      = ".tif"
+    _GPS_ALTITUDE = "H80"
+
+    def __init__(
+        self,
+        data_root:      str,
+        gps_file:       str                = "Dense_GPS_test.txt",
+        drone_altitude: str                = "H80",
+        transform_sat:  Optional[Callable] = None,
+    ) -> None:
+        self.data_root      = os.path.abspath(data_root)
+        self.drone_altitude = drone_altitude
+        self.transform_sat  = transform_sat
+
+        gps_path = os.path.join(self.data_root, gps_file)
+        self._gps: Dict[str, Tuple[float, float, float]] = (
+            _parse_gps_file(gps_path) if os.path.isfile(gps_path) else {}
+        )
+
+        self.samples: List[Tuple[str, int, Optional[Tuple[float, float]]]]
+        self.samples = self._build_samples()
+
+        if len(self.samples) == 0:
+            raise FileNotFoundError(
+                f"No gallery satellite images found under "
+                f"{os.path.join(self.data_root, 'test', 'gallery_satellite')}. "
+                "Verify that data_root points to the DenseUAV root directory "
+                "and that the test/gallery_satellite/ sub-tree is present."
+            )
+
+        self.has_gps: bool = any(s[2] is not None for s in self.samples)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_gps(self, loc_id: str) -> Optional[Tuple[float, float]]:
+        """Look up GPS for a gallery satellite location.
+
+        Tries multiple path prefixes and filename stems (H80 / H80_old) to be
+        robust against GPS-file variants.
+        """
+        for prefix in ("test/satellite", "test/gallery_satellite"):
+            for stem in (self._GPS_ALTITUDE, f"{self._GPS_ALTITUDE}_old"):
+                key   = f"{prefix}/{loc_id}/{stem}{self._SAT_EXT}"
+                entry = self._gps.get(key)
+                if entry is not None:
+                    lon, lat, _ = entry
+                    return (lon, lat)
+        return None
+
+    def _build_samples(
+        self,
+    ) -> List[Tuple[str, int, Optional[Tuple[float, float]]]]:
+        """Discover gallery images under test/gallery_satellite/ and build sample list."""
+        gallery_base = os.path.join(self.data_root, "test", "gallery_satellite")
+        if not os.path.isdir(gallery_base):
+            raise FileNotFoundError(
+                f"Test gallery_satellite directory not found: {gallery_base}"
+            )
+
+        loc_ids = sorted(
+            d for d in os.listdir(gallery_base)
+            if os.path.isdir(os.path.join(gallery_base, d))
+        )
+        samples = []
+
+        for loc_id in loc_ids:
+            sat_dir  = os.path.join(gallery_base, loc_id)
+            img_path = os.path.join(
+                sat_dir, f"{self.drone_altitude}{self._SAT_EXT}"
+            )
+            if not os.path.isfile(img_path):
+                # Fallback: first sorted .tif in the folder
+                candidates = sorted(
+                    glob.glob(os.path.join(sat_dir, f"*{self._SAT_EXT}"))
+                )
+                if not candidates:
+                    continue
+                img_path = candidates[0]
+
+            try:
+                label = int(loc_id)
+            except ValueError:
+                label = len(samples)
+
+            gps_xy = self._resolve_gps(loc_id)
+            samples.append((img_path, label, gps_xy))
+
+        return samples
+
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        img_path, label, gps_xy = self.samples[idx]
+
+        sat_pil = Image.open(img_path).convert("RGB")
+        if self.transform_sat is not None:
+            sat_img = self.transform_sat(sat_pil)
+        else:
+            from torchvision.transforms.functional import to_tensor
+            sat_img = to_tensor(sat_pil)
+
+        gps = (
+            torch.tensor(gps_xy, dtype=torch.float32)
+            if gps_xy is not None
+            else torch.zeros(2, dtype=torch.float32)
+        )
+
+        return {
+            "sat_img": sat_img,
+            "label":   torch.tensor(label, dtype=torch.long),
+            "sat_gps": gps,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"DenseUAVGallery("
+            f"n_gallery={len(self)}, "
+            f"altitude={self.drone_altitude!r}, "
+            f"has_gps={self.has_gps})"
+        )

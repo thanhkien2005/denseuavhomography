@@ -6,8 +6,13 @@ print Recall@K and SDM@K metrics.
 
 Run from repo root (denseuav-homo/):
 
-    # Evaluate checkpoint on the training split (proxy for val):
+    # Evaluate on the training split (proxy — measures memorisation):
     python scripts/eval.py --checkpoint outputs/denseuav_v1/epoch_0120.pt
+
+    # Evaluate on the official test split (777 queries vs 3033 gallery):
+    python scripts/eval.py \\
+        --checkpoint outputs/denseuav_v1/epoch_0120.pt \\
+        --split      test
 
     # Explicit options:
     python scripts/eval.py \\
@@ -24,9 +29,12 @@ Metrics are printed to stdout and appended to <output_dir>/eval.log.
 
 Notes
 -----
-- --split train uses DenseUAVPairs (2256 paired locations).
-- --split test requires DenseUAVQuery + DenseUAVGallery (not yet implemented);
-  a clear error is raised if requested.
+- --split train uses DenseUAVPairs (2256 paired locations, closed-set proxy).
+- --split test uses DenseUAVQuery (777 drone queries) + DenseUAVGallery
+  (3033 satellite gallery) — the official DenseUAV retrieval benchmark.
+  Requires test/query_drone/ and test/gallery_satellite/ under data_root;
+  a FileNotFoundError is raised with a clear message if they are absent.
+- SDM@K is skipped with a warning when GPS is unavailable for query or gallery.
 - The evaluator uses UAV images as queries and satellite images as the gallery.
 """
 
@@ -43,10 +51,10 @@ import yaml
 import torch
 from torch.utils.data import DataLoader
 
-from data.denseuav_dataset import DenseUAVPairs
+from data.denseuav_dataset import DenseUAVGallery, DenseUAVPairs, DenseUAVQuery
 from data.transforms       import build_transforms
 from engine.evaluator      import Evaluator
-from models.vit_siamese    import SiameseViT
+from models.vit_siamese    import SiameseViT, load_checkpoint_compat
 from utils.checkpoint      import load_checkpoint, unwrap_model
 from utils.logger          import get_logger
 
@@ -75,11 +83,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_root", default=None,
                    help="Override data_root from config.")
     p.add_argument(
-        "--split", default="train", choices=["train"],
+        "--split", default="train", choices=["train", "test"],
         help=(
             "Which split to evaluate on.  "
-            "Currently only 'train' is supported (requires DenseUAVPairs).  "
-            "Test-split support (DenseUAVQuery / DenseUAVGallery) is a TODO."
+            "'train' uses DenseUAVPairs (2256 paired locations, proxy metric).  "
+            "'test'  uses DenseUAVQuery (777 queries) + DenseUAVGallery "
+            "(3033 gallery items) — the official DenseUAV test protocol."
         ),
     )
     p.add_argument("--batch_size", type=int, default=None,
@@ -158,6 +167,9 @@ def main() -> None:
     tf_uav = build_transforms(img_size=img_size, is_train=False, modality="uav")
     tf_sat = build_transforms(img_size=img_size, is_train=False, modality="satellite")
 
+    is_split_eval: bool = False   # True for test split (separate q/g loaders)
+    compute_sdm:   bool = True    # set False when GPS is unavailable
+
     if args.split == "train":
         dataset = DenseUAVPairs(
             data_root      = data_root,
@@ -166,41 +178,85 @@ def main() -> None:
             transform_uav  = tf_uav,
             transform_sat  = tf_sat,
         )
-    else:
-        # Placeholder: test split requires DenseUAVQuery + DenseUAVGallery.
-        raise NotImplementedError(
-            "--split test is not yet implemented.  "
-            "Implement DenseUAVQuery and DenseUAVGallery in data/denseuav_dataset.py, "
-            "then use evaluator.evaluate_split(model, query_loader, gallery_loader)."
+        logger.info(f"  {dataset}")
+
+        loader = DataLoader(
+            dataset,
+            batch_size  = batch_size,
+            shuffle     = False,
+            num_workers = num_workers,
+            pin_memory  = device.type == "cuda",
+            drop_last   = False,
         )
+        logger.info(f"  {len(loader)} batches")
 
-    logger.info(f"  {dataset}")
+    else:  # "test" — official DenseUAV protocol: Q=777 queries vs G=3033 gallery
+        is_split_eval = True
 
-    loader = DataLoader(
-        dataset,
-        batch_size  = batch_size,
-        shuffle     = False,
-        num_workers = num_workers,
-        pin_memory  = device.type == "cuda",
-        drop_last   = False,
-    )
-    logger.info(f"  {len(loader)} batches")
+        query_dataset = DenseUAVQuery(
+            data_root      = data_root,
+            gps_file       = cfg.get("gps_test", "Dense_GPS_test.txt"),
+            drone_altitude = cfg.get("drone_altitude", "H80"),
+            transform_uav  = tf_uav,
+        )
+        gallery_dataset = DenseUAVGallery(
+            data_root      = data_root,
+            gps_file       = cfg.get("gps_test", "Dense_GPS_test.txt"),
+            drone_altitude = cfg.get("drone_altitude", "H80"),
+            transform_sat  = tf_sat,
+        )
+        logger.info(f"  {query_dataset}")
+        logger.info(f"  {gallery_dataset}")
+
+        compute_sdm = query_dataset.has_gps and gallery_dataset.has_gps
+        if not compute_sdm:
+            logger.warning(
+                "GPS coordinates are unavailable for query or gallery — "
+                "SDM@K will be skipped."
+            )
+
+        query_loader = DataLoader(
+            query_dataset,
+            batch_size  = batch_size,
+            shuffle     = False,
+            num_workers = num_workers,
+            pin_memory  = device.type == "cuda",
+            drop_last   = False,
+        )
+        gallery_loader = DataLoader(
+            gallery_dataset,
+            batch_size  = batch_size,
+            shuffle     = False,
+            num_workers = num_workers,
+            pin_memory  = device.type == "cuda",
+            drop_last   = False,
+        )
+        logger.info(
+            f"  {len(query_loader)} query batches, "
+            f"{len(gallery_loader)} gallery batches"
+        )
 
     # ── Model ─────────────────────────────────────────────────────────────
     logger.info("Building model …")
 
+    # num_classes must match the training checkpoint; read from config.
+    num_classes = cfg.get("num_classes", 2256)
+    head_cfg    = cfg.get("head", {})
+
     # When loading a checkpoint the weights override the backbone anyway;
     # setting pretrained=False avoids a redundant download.
     model = SiameseViT(
-        num_classes    = dataset.num_classes,
-        embed_dim      = cfg.get("embed_dim", 384),
-        img_size       = img_size,
-        patch_size     = cfg.get("patch_size", 16),
-        gem_p          = cfg.get("gem_p", 3.0),
-        gem_learnable  = cfg.get("gem_learnable", True),
-        pretrained     = False,
-        homo_hidden    = cfg.get("homo_hidden", 256),
-        gate_bias_init = cfg.get("gate_bias_init", -2.0),
+        num_classes          = num_classes,
+        embed_dim            = cfg.get("embed_dim", 384),
+        img_size             = img_size,
+        patch_size           = cfg.get("patch_size", 16),
+        gem_p                = cfg.get("gem_p", 3.0),
+        gem_learnable        = cfg.get("gem_learnable", True),
+        pretrained           = False,
+        homo_hidden          = cfg.get("homo_hidden", 256),
+        gate_bias_init       = cfg.get("gate_bias_init", -2.0),
+        head_scale           = head_cfg.get("scale", 30.0),
+        head_learnable_scale = head_cfg.get("learnable_scale", True),
     )
 
     # ── Load checkpoint ───────────────────────────────────────────────────
@@ -208,7 +264,7 @@ def main() -> None:
     ckpt = load_checkpoint(args.checkpoint, map_location="cpu", logger=logger)
 
     state_dict = ckpt.get("model", ckpt)   # support both wrapped and bare state dicts
-    unwrap_model(model).load_state_dict(state_dict)
+    load_checkpoint_compat(unwrap_model(model), state_dict, logger=logger)
     ckpt_epoch = ckpt.get("epoch", "?")
     logger.info(f"  checkpoint epoch : {ckpt_epoch}")
 
@@ -231,8 +287,16 @@ def main() -> None:
 
     # ── Run evaluation ────────────────────────────────────────────────────
     logger.info(f"\nRunning {args.split}-split evaluation …")
-    prefix  = f"{args.split}/"
-    metrics = evaluator.evaluate(model, loader, prefix=prefix)
+    prefix = f"{args.split}/"
+
+    if is_split_eval:
+        metrics = evaluator.evaluate_split(
+            model, query_loader, gallery_loader,
+            prefix      = prefix,
+            compute_sdm = compute_sdm,
+        )
+    else:
+        metrics = evaluator.evaluate(model, loader, prefix=prefix)
 
     # ── Print results ─────────────────────────────────────────────────────
     logger.info("")
@@ -240,11 +304,13 @@ def main() -> None:
     logger.info(f"  Results  (checkpoint epoch {ckpt_epoch})")
     logger.info("=" * 60)
 
-    # Print Recall@K first, then SDM@K
+    # Print Recall@K first, then SDM@K (SDM absent when GPS unavailable)
     for section, keys in [
         ("Recall@K", [k for k in metrics if "Recall" in k]),
         ("SDM@K",    [k for k in metrics if "SDM"    in k]),
     ]:
+        if not keys:
+            continue
         logger.info(f"  {section}:")
         for key in sorted(keys, key=lambda s: int(s.split("@")[1])):
             logger.info(f"    {key:<22} = {metrics[key]:.4f}")

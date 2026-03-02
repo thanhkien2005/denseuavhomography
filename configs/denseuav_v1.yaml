@@ -32,6 +32,11 @@ gate_bias_init: -2.0   # sigmoid(-2) ≈ 0.12 → small warp contribution at sta
 
 num_classes: 2256      # number of training location classes
 
+# ---------- classifier head ----------
+head:
+  scale: 30.0            # initial logit scale s; logits ∈ [−s, s] for L2-norm inputs
+  learnable_scale: true  # if true, s is updated by the main optimiser
+
 # ---------- training ----------
 seed: 42
 epochs: 120
@@ -51,8 +56,19 @@ loss:
   w_ce:       1.0    # cross-entropy weight
   w_triplet:  1.0    # soft-weighted triplet weight
   w_kl:       1.0    # bi-directional KL (mutual learning) weight
-  temperature: 0.07  # logit scale temperature for KL / CE
+  w_homo:     0.5    # homography feature-alignment weight
+  lambda_reg: 0.01   # delta L2 regularisation inside HomographyAlignmentLoss
+  temperature: 4.0   # KL softmax temperature; T²-scaled to preserve gradient magnitude
   margin:      0.3   # triplet margin
+
+# ---------- contrastive learning ----------
+# InfoNCE with a memory queue of cross-batch negatives.
+# Prevents the metric loss from collapsing once in-batch negatives are separated.
+contrastive:
+  use_contrastive: true
+  queue_size:  4096    # number of past-batch embeddings kept as negatives
+  temperature: 0.07    # InfoNCE temperature (separate from KL temperature=4.0)
+  w_contrastive: 1.0   # weight of the InfoNCE term in the total loss
 
 # ---------- evaluation ----------
 recall_k: [1, 5, 10]   # Recall@K values to report

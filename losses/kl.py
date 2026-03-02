@@ -14,9 +14,17 @@ Dividing logits by T before softmax controls distribution sharpness:
     T = 1 : standard softmax
     T >> 1 : uniform → KL gradient is dominated by noise
 
-The spec default T = 0.07 follows the contrastive-learning convention
-(e.g. CLIP).  For mutual distillation, values in 0.5–4.0 are also common;
-tune via config/denseuav_v1.yaml → loss.temperature.
+T = 0.07 (contrastive-learning default) produces near-one-hot distributions
+from the start.  Once both branches agree on the top class, KL → 0 and the
+term contributes nothing to training.  T = 4.0 keeps distributions soft
+enough for continued mutual-learning gradient throughout training.
+
+T² scaling (Hinton et al. 2015)
+────────────────────────────────
+When logits are divided by T the gradient of KL w.r.t. the logits is also
+divided by T (chain rule through softmax).  Multiplying the loss by T² restores
+the gradient magnitude to the T = 1 scale, preventing the KL term from being
+swamped by CE/triplet terms just because T is large.
 
 Formula
 ───────
@@ -26,7 +34,7 @@ Formula
     KL(P_u ‖ P_s) = Σ_c P_u_c · (log P_u_c − log P_s_c)
     KL(P_s ‖ P_u) = Σ_c P_s_c · (log P_s_c − log P_u_c)
 
-    L_kl = [KL(P_u ‖ P_s) + KL(P_s ‖ P_u)] / 2
+    L_kl = T² · [KL(P_u ‖ P_s) + KL(P_s ‖ P_u)] / 2
 
 Shape:
     logit_u : (B, C)   UAV classifier logits
@@ -49,7 +57,7 @@ class BidirectionalKLLoss(nn.Module):
         temperature: Logit scaling before softmax.  Must be > 0.
     """
 
-    def __init__(self, temperature: float = 0.07) -> None:
+    def __init__(self, temperature: float = 4.0) -> None:
         super().__init__()
         assert temperature > 0.0, \
             f"temperature must be > 0, got {temperature}"
@@ -63,7 +71,7 @@ class BidirectionalKLLoss(nn.Module):
             logit_s: (B, C)  Satellite classifier logits.
 
         Returns:
-            Scalar loss: mean of KL(P_u ‖ P_s) and KL(P_s ‖ P_u).
+            Scalar loss: T² · mean of KL(P_u ‖ P_s) and KL(P_s ‖ P_u).
 
         Shape trace:
             logit_u / T      : (B, C)
@@ -71,7 +79,7 @@ class BidirectionalKLLoss(nn.Module):
             log_p_s          : (B, C)    log-probabilities for SAT branch
             kl_u_s           : ()        KL(P_u ‖ P_s)  using log_target=True
             kl_s_u           : ()        KL(P_s ‖ P_u)  using log_target=True
-            output           : ()        (kl_u_s + kl_s_u) / 2
+            output           : ()        T² · (kl_u_s + kl_s_u) / 2
 
         Note on F.kl_div convention:
             F.kl_div(input=log_q, target=log_p, log_target=True)
@@ -109,4 +117,6 @@ class BidirectionalKLLoss(nn.Module):
             log_target=True,
         )   # scalar  KL(P_s ‖ P_u)
 
-        return (kl_u_s + kl_s_u) * 0.5
+        # T² factor restores gradient magnitude to the T=1 scale
+        # (Hinton et al. 2015 — classic knowledge distillation scaling).
+        return (kl_u_s + kl_s_u) * 0.5 * (T * T)

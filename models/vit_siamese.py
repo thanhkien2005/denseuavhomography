@@ -48,6 +48,9 @@ forward() output dict
     "logit_sat"  : (B, num_classes) — SAT classifier logits
     "gate_logit" : (B, 1)           — raw gate logit (sigmoid → gate g)
     "delta"      : (B, 8)           — predicted corner displacements
+    "Fu_raw"     : (B, 384, 32, 32) — UAV feature map before warp (for homo loss)
+    "Fu_warped"  : (B, 384, 32, 32) — UAV feature map after warp  (for homo loss)
+    "Fs"         : (B, 384, 32, 32) — SAT feature map             (for homo loss)
 }
 """
 
@@ -65,7 +68,8 @@ from torch import Tensor
 
 # Allow running this file directly (python models/vit_siamese.py)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from models.heads import GeM
+from models.cosine_head    import CosineClassifier
+from models.heads          import GeM
 from models.homography_net import HomographyNet
 from models.homography_warp import HomographyWarpLayer
 
@@ -156,9 +160,11 @@ class SiameseViT(nn.Module):
         patch_size:     ViT patch size (16).
         gem_p:          Initial GeM power parameter.
         gem_learnable:  Whether to learn GeM p during training.
-        pretrained:     If True, load ImageNet-pretrained timm weights.
-        homo_hidden:    Hidden width of HomographyNet (default 256).
-        gate_bias_init: Initial gate bias; sigmoid of this → initial g.
+        pretrained:          If True, load ImageNet-pretrained timm weights.
+        homo_hidden:         Hidden width of HomographyNet (default 256).
+        gate_bias_init:      Initial gate bias; sigmoid of this → initial g.
+        head_scale:          Initial logit scale s for CosineClassifier (30.0).
+        head_learnable_scale: If True, s is learned; otherwise fixed.
     """
 
     _BACKBONE_NAME = "vit_small_patch16_224"
@@ -172,8 +178,10 @@ class SiameseViT(nn.Module):
         gem_p:          float = 3.0,
         gem_learnable:  bool  = True,
         pretrained:     bool  = True,
-        homo_hidden:    int   = 256,
-        gate_bias_init: float = -2.0,
+        homo_hidden:         int   = 256,
+        gate_bias_init:      float = -2.0,
+        head_scale:          float = 30.0,
+        head_learnable_scale: bool = True,
     ) -> None:
         super().__init__()
 
@@ -229,9 +237,15 @@ class SiameseViT(nn.Module):
         # ── Shared pooling + classifier ───────────────────────────────────
         # GeM: (B, 384, 32, 32) → (B, 384)
         self.gem        = GeM(p=gem_p, learnable=gem_learnable)
-        # Linear classifier: (B, 384) → (B, num_classes)
-        # bias=False: embeddings are L2-normalised so a bias would break symmetry
-        self.classifier = nn.Linear(embed_dim, num_classes, bias=False)
+        # Cosine classifier: logits = s * (emb @ normalize(W)^T)
+        # With L2-normalised inputs logits ∈ [−s, s]; s≈30 prevents
+        # the CE ≈ ln(C) ceiling caused by plain Linear on a unit sphere.
+        self.classifier = CosineClassifier(
+            in_features     = embed_dim,
+            num_classes     = num_classes,
+            scale           = head_scale,
+            learnable_scale = head_learnable_scale,
+        )
 
     # ──────────────────────────────────────────────────────────────────────
     # Public feature-extraction helpers
@@ -316,6 +330,9 @@ class SiameseViT(nn.Module):
             "logit_sat"  : (B, num_classes)  satellite classifier logits
             "gate_logit" : (B, 1)            raw gate logit; sigmoid → g
             "delta"      : (B, 8)            predicted corner displacements
+            "Fu_raw"     : (B, 384, 32, 32)  UAV feature map before warp
+            "Fu_warped"  : (B, 384, 32, 32)  UAV feature map after warp
+            "Fs"         : (B, 384, 32, 32)  satellite feature map
         """
         # ── 1-2. Extract feature maps via shared backbone ──────────────────
         tokens_uav = self.forward_features(uav_img)        # (B, 1025, 384)
@@ -349,6 +366,9 @@ class SiameseViT(nn.Module):
             "logit_sat":  logit_sat,     # (B, num_classes)
             "gate_logit": gate_logit,    # (B, 1)
             "delta":      delta,         # (B, 8)
+            "Fu_raw":     Fu_raw,        # (B, 384, 32, 32)
+            "Fu_warped":  Fu_warped,     # (B, 384, 32, 32)
+            "Fs":         Fs,            # (B, 384, 32, 32)
         }
 
     def __repr__(self) -> str:
@@ -361,4 +381,56 @@ class SiameseViT(nn.Module):
             f"embed_dim={self.embed_dim}, "
             f"num_classes={self.num_classes}, "
             f"params={n_param:.1f}M)"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backward-compatible checkpoint loading
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Keys that exist in the new model but not in checkpoints trained before the
+# CosineClassifier upgrade.  These are safe to initialise from the default
+# CosineClassifier.__init__ rather than from the checkpoint.
+_COSINE_HEAD_NEW_KEYS: frozenset[str] = frozenset({"classifier.scale"})
+
+
+def load_checkpoint_compat(
+    model:      nn.Module,
+    state_dict: dict,
+    logger=None,
+) -> None:
+    """Load a state dict with backward compatibility for the cosine-head upgrade.
+
+    When loading a checkpoint trained with the old ``nn.Linear`` classifier
+    the key ``classifier.scale`` will be absent.  This function:
+
+    - Loads with ``strict=False``.
+    - Silently accepts ``classifier.scale`` as missing (keeps init value)
+      and logs a single warning.
+    - Raises ``RuntimeError`` for any other missing or unexpected keys.
+
+    Args:
+        model:      The *unwrapped* SiameseViT (pass ``unwrap_model(model)``
+                    when using DataParallel).
+        state_dict: The ``"model"`` dict from a saved checkpoint.
+        logger:     Optional Python logger; falls back to ``print``.
+    """
+    _warn = (lambda msg: logger.warning(msg)) if logger else print
+
+    res = model.load_state_dict(state_dict, strict=False)
+
+    truly_missing = [k for k in res.missing_keys if k not in _COSINE_HEAD_NEW_KEYS]
+    truly_extra   = list(res.unexpected_keys)
+
+    if res.missing_keys and not truly_missing:
+        _warn(
+            "Pre-cosine-head checkpoint: 'classifier.scale' absent — "
+            "keeping CosineClassifier init value (s=30.0).  "
+            "Fine-tune from this checkpoint to learn the scale."
+        )
+
+    if truly_missing or truly_extra:
+        raise RuntimeError(
+            f"Checkpoint mismatch — "
+            f"missing: {truly_missing}, unexpected: {truly_extra}"
         )
