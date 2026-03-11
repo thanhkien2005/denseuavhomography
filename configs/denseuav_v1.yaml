@@ -65,7 +65,7 @@ loss:
 # InfoNCE with a memory queue of cross-batch negatives.
 # Prevents the metric loss from collapsing once in-batch negatives are separated.
 contrastive:
-  use_contrastive: true
+  use_contrastive: false
   queue_size:  4096    # number of past-batch embeddings kept as negatives
   temperature: 0.07    # InfoNCE temperature (separate from KL temperature=4.0)
   w_contrastive: 1.0   # weight of the InfoNCE term in the total loss
